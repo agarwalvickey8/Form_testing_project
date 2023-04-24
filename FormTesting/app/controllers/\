@@ -1,0 +1,1600 @@
+require 'net/http'
+require 'base64'
+require 'digest'
+require 'securerandom'
+require 'open-uri'
+require 'json'
+require 'nokogiri'
+require 'faker'
+
+class SearchController < ApplicationController
+	def search
+		@url = params[:url]
+		if !@url.nil?
+			begin
+				@map_results = {}
+				data_code, data_body = send_request_to_plugin(@url)
+				if data_code != '200'
+					@map_results['pluginrequesterror'] = 'Plugin is not installed on the website.'
+					render json: { mapResult: @map_results }
+				else
+					@results = JSON.parse(data_body)
+					if !@results.nil?
+						@results.each do |form_type, result|	
+							case form_type	
+							when "nf"
+								@nf = NF.new
+								@map_results = @map_results.merge(@nf.solve_nf(result, @url))
+							when "cf7"
+								@cf = CF7.new
+								@map_results = @map_results.merge(@cf.solve_cf7(result, @url))
+							when "wp"
+								@wp = WPForms.new
+								@map_results = @map_results.merge(@wp.solvewpforms(result, @url))
+							when "ff"
+								@ff = FluentForms.new
+								@map_results = @map_results.merge(@ff.solvefluentforms(result, @url))
+							when "formidable"
+								@formidable = FormidableFormTests.new
+								@map_results = @map_results.merge(@formidable.solve(result, @url))	
+							when "forminator"
+								@forminator = ForminatorFormTests.new
+								@map_results = @map_results.merge(@forminator.solve(result, @url))	
+							else
+							end
+						end
+					end
+					render json: { mapResult: @map_results }
+				end
+			end
+		end
+	end
+
+	def send_request_to_plugin(url)
+		url = (url + "?formtesting=true")
+		uri = URI(url) 
+		http = Net::HTTP.new(uri.host, uri.port)
+		http.read_timeout = 20
+		request = Net::HTTP::Get.new(uri)
+		response = http.request(request)	
+		return response.code, response.body
+	end
+end
+
+class Helper
+	def self.generateUID(formid, formname)
+		(formname + "_" + formid.to_s)
+	end
+
+	def self.mime_type(filename)
+		case File.extname(filename)
+		when ".png" then "image/png"
+		when ".jpg", ".jpeg" then "image/jpeg"
+		when ".gif" then "image/gif"
+		else "application/octet-stream"
+		end
+	end
+
+	def self.post_request(form_url, payload)
+		uri = URI.parse(form_url)
+		request = Net::HTTP::Post.new(uri)
+		request.set_form(payload)
+		request["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+		http = Net::HTTP.new(uri.host, uri.port)
+		response = http.request(request)	
+		#response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+		#	http.request(request)
+		#end
+		response
+	end
+
+	def self.validate_form(html_fields, db_fields)
+		html_names = []
+		db_names = []
+		html_fields.each do |field|	
+			html_names.append(field.gsub(" *", ""))
+		end
+		db_fields.each do |field|
+			name = field.fetch("name", nil)
+			type = field.fetch("type", nil)
+			db_names.append(name) if name.present? && type!="submit"
+		end	
+		missing_fields = html_names - (html_names & db_names)
+		return missing_fields.empty?, missing_fields
+	end
+
+	def self.get_form_html(html_content, formid)
+		doc = Nokogiri::HTML(html_content)
+		form = doc.css('form').first
+		form
+	end
+
+	def self.compare_images(image_data1, image_data2)
+		data1 = Base64.decode64(image_data1)
+		data2 = Base64.decode64(image_data2)
+		hash1 = Digest::SHA1.digest(data1)
+		hash2 = Digest::SHA1.digest(data2)
+		return hash1 == hash2 ? 1.0 : 0.0
+	end
+
+	def self.get_screenshot_data(screenshots, screenshotsaftersubmission)	
+		data = []
+		screenshotsvalidated = true
+		for i in 0...screenshots.length do
+			img1 = screenshots[i]['screenshot']
+			img2 = screenshotsaftersubmission[i]['screenshot']
+			score = Helper.compare_images(img1, img2);
+			difference = "Yes"
+			if score == 1.0
+				difference = "No"
+			else
+				screenshotsvalidated = false
+			end
+			data << { 
+				"formurl" => screenshots[i]['formurl'], 
+				"screenshot_before" => screenshots[i]['screenshot'], 
+				"screenshot_after" => screenshotsaftersubmission[i]['screenshot'], 
+				"difference" => difference }
+		end
+		return data, screenshotsvalidated
+	end
+
+	def self.getscreenshots(formid, formurls)
+		results = []
+		formurls.each do |formurl|
+			uri = URI.parse("http://localhost:3002/search")
+			header = {'Content-Type': 'text/json'}
+			body = { url: formurl, formId: formid }
+			http = Net::HTTP.new(uri.host, uri.port)
+			request = Net::HTTP::Post.new(uri.request_uri, header)
+			request.body = body.to_json
+			response = http.request(request)
+			result = response.body
+			results << { "formurl" => formurl, "screenshot" => result }
+		end
+		results
+	end
+
+	def self.get_form_field_count(sample_values)
+		count = 0
+		sample_values.each do |sample_value|
+			if sample_value["type"] != 'hidden' && sample_value["type"] != 'submit' && sample_value["type"] != 'hr' && sample_value["type"] != 'html' && sample_value["type"] != 'repeater'
+				count = count + 1
+			end
+		end
+		count
+	end
+
+	def self.get_validations_map(validations)
+		arr = validations.split(';')
+		map = {}
+		arr.each do |item|
+			key_value = item.split('=')
+			map[key_value[0]] = key_value[1] unless key_value[0].nil?
+		end
+		map
+	end
+
+	def self.generate_sample_values(formfields, formurl, formid)
+		sample_values = []
+		file_field_present = false
+		formfields.each do |field|
+			id = field.fetch("id", "")
+			name = field.fetch("name", "")
+			type = field.fetch("type", "")
+			value = field.fetch("value", "")
+			validations = field.fetch("validations", "")
+			class_attribute = field.fetch("class", "")
+			file_field_present, sample_value = Helper.get_sample_value(formid, id, name, type, value, validations, formurl, file_field_present)	
+			sample_values << {"id" => id, "name" => name, "type" => type, "value" => sample_value }	
+		end
+		return file_field_present, sample_values	
+	end
+
+	def self.refine_sample_values(temp_sample_values)
+		sample_values = []
+		temp_sample_values.each do |s_value|
+			if !s_value['name'].nil? && !s_value['name'].empty? && s_value['type']!='hr' && 
+				s_value['type']!='submit' && s_value['type']!='repeater' && 
+				s_value['type']!='html' && s_value['type']!='hidden'
+				sample_values << s_value
+			end
+		end
+		sample_values
+	end
+
+	@count = 0
+	@field_name = "#"
+	def self.get_sample_value(formid, id, name, type, value, validations, formurl, file_field_present)
+		validations_map = Helper.get_validations_map(validations)
+		samplevalue = value
+		case type
+		when 'text'
+			if name == "wpforms[hp]"
+				samplevalue = nil
+			#elsif !id.nil? && !id.empty?
+			#field_value = get_image_data(formid, id, formurl)
+			#file_field_present = true
+			else
+				samplevalue = 'Sample Text'
+			end
+		when 'email'
+			samplevalue = 'sample@email.com'
+		when 'number'
+			samplevalue = '12345'
+		when 'password'
+			samplevalue = 'samplepass@123'
+		when 'textarea'
+			samplevalue = 'Sample Text Area'
+		when 'radio'
+			samplevalue = "one"
+		when "range"
+			samplevalue = value
+		when 'checkbox'
+			samplevalue = "one"
+		when 'select'
+			samplevalue = "one"
+		when 'file'
+			url = 'https://sample-videos.com/img/Sample-png-image-100kb.png' 
+			filename = 'sample_image.png' 
+			File.open(filename, 'wb') do |file|
+				file.write open(url).read
+			end
+			samplevalue = filename
+		when 'time'
+			samplevalue = "10:10:10"
+		when 'date'	
+			if !validations_map.key?("date_mode")
+				samplevalue = "2010-02-21"
+			elsif(validations_map['date_mode'] == "time_only")
+				if(validations_map['hours_24'] == "0")
+					s_value = { 
+					'date' => '', 
+					'hour' => '10',
+					'minute' => '00',
+					'ampm' => 'am'
+					}
+					samplevalue = s_value
+				else
+					s_value = { 
+					'date' => '', 
+					'hour' => '10',
+					'minute' => '00'
+					}
+					samplevalue = s_value
+				end
+			else	
+				date = Helper.get_sample_date(validations_map['date_format'])
+				if(validations_map['date_mode'] == "date_only")
+					samplevalue = date
+				else
+					if(validations_map['hours_24'] == "0")
+						s_value = { 
+						'date' => date, 
+						'hour' => '10',
+						'minute' => '00',
+						'ampm' => 'am'
+						}	
+						samplevalue = s_value
+					else
+						s_value = { 
+						'date' => date, 
+						'hour' => '10',
+						'minute' => '00'
+						}
+						samplevalue = s_value
+					end
+				end
+			end	
+		when 'tel'
+			samplevalue = '+11234567890'
+		when 'phone'
+			samplevalue = '+11234567890'
+		when 'url'
+			samplevalue = 'https://www.example.com'
+		when 'color'
+			samplevalue = '#000000'
+		when 'hidden'
+			samplevalue = value
+		when 'hr'
+			samplevalue = value
+		when 'submit'
+			samplevalue = value
+		when 'firstname'
+			samplevalue = 'Sample First Name'
+		when 'lastname'
+			samplevalue = 'Sample Last Name'
+		when 'textbox'
+			samplevalue = 'Sample Text'
+		when 'listcheckbox'
+			s_value = []
+			s_value << "one"
+			s_value << "two"
+			samplevalue = s_value
+		when 'listimage'
+		when 'listmultiselect'
+			s_value = []
+			s_value << "one"
+			s_value << "two"
+			samplevalue = s_value
+		when 'listradio'
+			samplevalue = "one"
+		when 'listselect'
+			samplevalue = "one"
+		when 'address'
+			samplevalue = 'Sample Address'
+		when 'zip'
+			samplevalue = '000000'
+		when 'liststate'
+			samplevalue = 'Alaska'
+		when 'listcountry'
+			samplevalue = 'US'
+		when 'confirm'
+			samplevalue = 'Confirm'
+		when 'spam'
+			samplevalue = value
+		when 'starrating'
+			samplevalue = "2"
+		else
+			samplevalue = 'Sample Value'
+		end
+		if validations_map['minlength']
+			minlength = validations_map['minlength']
+			if samplevalue.length < minlength.to_i
+				samplevalue = samplevalue.rjust(minlength.to_i, '0')
+			end
+		end
+		if validations_map['maxlength']
+			maxlength = validations_map['maxlength']
+			if samplevalue.length > maxlength.to_i
+				samplevalue = samplevalue[0, maxlength.to_i]
+			end
+		end
+		return file_field_present, samplevalue
+	end
+
+	def self.get_sample_date(date_format)
+		case date_format
+		when "DD/MM/YYYY"
+		'17/03/2023' 
+		when 'DD-MM-YYYY'
+		'17-03-2023' 
+		when 'DD.MM.YYYY'
+		'17.03.2023' 
+		when 'MM/DD/YYYY'
+		'03/17/2023' 
+		when 'MM-DD-YYYY'
+		'03-17-2023' 
+		when 'MM.DD.YYYY'
+		'03.17.2023' 
+		when 'YYYY-MM-DD'
+		'2023-03-17' 
+		when 'YYY/MM/DD'
+		'2023/03/17' 
+		when 'YYYY.MM.DD'
+		'2023.03.17' 
+		when "dddd, MMMM D YYYY"
+		'Friday, November 18, 2019'
+		else 
+			'2023-01-30'
+		end
+	end
+end
+
+class CF7
+	def solve_cf7(results, url)
+		map_result = {}
+		results.each do |result|
+			result = result[1]
+			map_form_results = {}
+			formid = result['formid']
+			formurls = result['formurls']
+			formname = result['formname']
+			formfields = result['formfields']
+			formaction = result['formaction']
+			form_action_key = formaction.split('#', 2)
+			formactionurl = formurls[0] + '#' + form_action_key.last
+			email = result['email']
+			email_disabled = result['emaildisabled']
+			additional_settings = result['additionalsettings']
+			map_form_results['formid'] = formid
+			map_form_results['formurls'] = formurls
+			screenshots = Helper.getscreenshots(formid, formurls)
+			map_form_results['screenshots'] = screenshots
+			map_form_results['formname'] = formname
+			map_form_results['formtype'] = "Contact Form 7"
+			map_form_results['formfieldsfromdb'] = formfields
+			map_form_results['formaction'] = formactionurl
+			map_form_results['email'] = email
+			map_form_results['emaildisabled'] = email_disabled
+			map_form_results['emailhost'] = email['recipient']
+			map_form_results['additionalsettings'] = additional_settings
+			form_html = get_html(form_action_key.last, formurls[0])
+			if form_html
+				inputs_array = form_html.css('input', 'textarea')
+				inputs = []
+				inputs_array.each do |field|
+					name = field.attributes["name"].try(:value)
+					inputs.append(name)
+				end
+				inputs.pop()	
+				map_form_results['formfieldsfromhtml'] = inputs
+				fields_validated, missing_fields = Helper.validate_form(inputs, formfields)
+				map_form_results['fieldsvalidated'] = fields_validated
+				if fields_validated
+					file_field_present, sample_values = Helper.generate_sample_values(formfields, formurls[0], formid)
+					form_field_count = Helper.get_form_field_count(sample_values)
+					map_form_results['formfieldcount'] = form_field_count
+					sample_values = Helper.refine_sample_values(sample_values)
+					#updated_sample_values = update_sample_values(sample_values, form_html)
+					map_form_results['samplevalues'] = sample_values
+					submit_url = url + 'index.php/wp-json/contact-form-7/v1/contact-forms/' + formid + '/feedback'
+					post_response = send_post_request(submit_url, sample_values, email_disabled, map_form_results['emailhost'])
+					map_form_results['formsubmitted'] = false
+					map_form_results['formvalidationerror'] = 'None'
+					if !post_response.nil?
+						post_response_body = JSON.parse(post_response.body)
+						case post_response_body["status"]
+						when "mail_sent"
+							map_form_results['formsubmitted'] = true
+							map_form_results['formvalidationerror'] = 'None'
+						when "mail_failed"
+							map_form_results['formsubmitted'] = false
+							map_form_results['formvalidationerror'] = 'Invalid email address or a server error.'
+						when "validation_error"
+							map_form_results['formsubmitted'] = false
+							map_form_results['formvalidationerror'] = 'One or more required fields are missing or have incorrect values.'
+						when "spam"
+							map_form_results['formsubmitted'] = false
+							map_form_results['formvalidationerror'] = 'Form submission is detected as spam.'
+						end
+					end
+				else
+					map_form_results['formvalidationerror'] = 'Field validation unsuccessful.'
+				end
+				if !map_form_results['formsubmitted'] || !map_form_results['fieldsvalidated']
+					map_form_results['formvalidated'] = false
+				else
+					map_form_results['formvalidationerror'] = 'Field validation unsuccessful.'
+				end
+				map_form_results['formvalidated'] = true
+				map_form_results["screenshotsvalidated"] = false
+				if !map_form_results['formsubmitted'] || !map_form_results['fieldsvalidated']
+					map_form_results['formvalidated'] = false
+				else	
+					screenshotsaftersubmission = Helper.getscreenshots(formid, formurls)
+
+					data, screenshotsvalidated = Helper.get_screenshot_data(screenshots, screenshotsaftersubmission)
+					map_form_results['screenshotdataaftersubmission'] = data
+					if screenshotsvalidated
+						map_form_results["screenshotsvalidated"] = true
+						map_form_results['formvalidated'] = true
+					else
+						map_form_results["formvalidationerror"] = "Error in screenshot validation."
+					end
+				end
+			end
+			map_result[Helper.generateUID(map_form_results['formid'], map_form_results['formtype'])] = map_form_results
+		end
+		map_result
+	end
+
+	def update_sample_values(sample_values, form_html)
+		updated_sample_values = []
+		inputs_array = form_html.css('input, textarea')
+		debugger
+		inputs = []
+		inputs_array.each do |field|
+			type = field.attributes["type"].try(:value)
+			if type==='hidden'
+				next
+			end
+			name2 = field.attributes["name"].try(:value)
+			label = field.parent.parent.css('label').first
+			if label.present?
+				name = label.text.strip
+			else
+				name = name2	
+			end
+			debugger
+			sample_values.each do |sample_value|
+				id = sample_value['id']
+				type = sample_value['type']
+				value = sample_value['value']
+				if sample_value["name"] == name2
+					updated_sample_values << {"id" => id, "name" => name, "type" => type, "value" => value }	
+				end
+			end
+		end	
+		updated_sample_values
+	end
+
+	def get_html(formaction, url)	
+		html_content = open(url)
+		get_form_html(html_content, formaction)
+	end
+
+	def get_form_html(html_content, formaction)
+		last_hyphen_index = formaction.rindex("-")
+		key = formaction[0...last_hyphen_index]
+
+		doc = Nokogiri::HTML(html_content)
+		form = doc.css("div[action*=\"#{key}\"]")
+		form	
+	end
+
+	def send_post_request(url, data, email_disabled, email_host)
+		boundary = "----WebKitFormBoundary#{SecureRandom.hex(8)}"
+		headers = {
+			'Content-Type' => "multipart/form-data; boundary=#{boundary}"
+		}
+		uri = URI.parse(url)
+		http = Net::HTTP.new(uri.host, uri.port)
+		request = Net::HTTP::Post.new(uri.path, headers)
+		post_body = []
+		data.each do |data|
+			post_body << "--#{boundary}\r\n"
+			if data["type"] != "file"
+				post_body << "Content-Disposition: form-data; name=\"#{data["name"]}\"\r\n\r\n"
+				post_body << "#{data["value"]}\r\n"
+			else
+				file_data = File.read(data["value"], mode: 'rb')
+				file_name = data["value"].split('/', -1).last
+				post_body << "Content-Disposition: form-data; name=\"#{data["name"]}\"; filename=\"#{file_name}\"\r\n\r\n"
+				post_body << "Content-Type: #{Helper.mime_type(data["value"])}\r\n\r\n"
+				post_body << file_data
+				post_body << "\r\n"
+			end
+		end
+		post_body << "--#{boundary}--\r\n"
+		request.body = post_body.join
+		response = http.request(request)
+		doc = Nokogiri::HTML(response.body)
+		response
+	end
+end
+
+class NF
+	def solve_nf(results, url)	
+		map_result = {}
+		results.each do |result|
+			result = result[1]
+			map_form_results = {}
+			formid = result['formid']
+			formurls = result['formurls']
+			formname = result['formname']
+			formfields = result['formfields']
+			email = result['email']
+			email_disabled = result['emaildisabled']	
+			additional_settings = result['additionalsettings']
+			map_form_results['formid'] = formid
+			map_form_results['formurls'] = formurls
+			screenshots = Helper.getscreenshots(formid, formurls)	
+			map_form_results['screenshots'] = screenshots
+			map_form_results['formname'] = formname
+			map_form_results['formtype'] = "Ninja Form"
+			map_form_results['formfieldsfromdb'] = formfields
+			map_form_results['email'] = email
+			map_form_results['emaildisabled'] = email_disabled
+			map_form_results['emailhost'] = ""
+			map_form_results['additionalsettings'] = additional_settings
+			form_html = get_html(formid, formurls[0])	
+			if form_html
+				inputs_array = form_html.css("div.nf-field-label")
+				inputs = inputs_array.map { |label| label.text.strip }
+				inputs.pop()		
+				map_form_results['formfieldsfromhtml'] = inputs
+				fields_validated, missing_fields = Helper.validate_form(inputs, formfields)	
+				map_form_results['fieldsvalidated'] = fields_validated
+				if fields_validated
+					file_field_present, sample_values = Helper.generate_sample_values(formfields, formurls[0], formid)	
+					form_field_count = Helper.get_form_field_count(sample_values)
+					map_form_results['formfieldcount'] = form_field_count
+					sample_values = Helper.refine_sample_values(sample_values)
+					map_form_results['samplevalues'] = sample_values
+					submit_url = url + 'wp-admin/admin-ajax.php'
+					post_response = send_post_request(formid, submit_url, result, sample_values, true, "")	
+					map_form_results['formsubmitted'] = false
+					map_form_results['formvalidationerror'] = 'None'
+					if !post_response.nil?
+						post_response_body = JSON.parse(post_response.body)
+						if (post_response_body["data"]["actions"]["success_message"] != nil)
+							map_form_results['formsubmitted'] = true
+							map_form_results['formvalidationerror'] = 'None'
+						end
+						case post_response_body["data"]["actions"]["email"]["sent"]
+						when true
+							map_form_results['formsubmitted'] = true
+							map_form_results['formvalidationerror'] = 'None'
+						when false
+							map_form_results['formsubmitted'] = true
+							map_form_results['formvalidationerror'] = 'Mail not sent. Invalid email address or a server error.'
+						end
+					end
+				else
+					map_form_results['formvalidationerror'] = 'Field validation unsuccessful.'
+				end
+				map_form_results["screenshotsvalidated"] = false
+				if !map_form_results['formsubmitted'] || !map_form_results['fieldsvalidated']
+					map_form_results['formvalidated'] = false
+				else	
+					screenshotsaftersubmission = Helper.getscreenshots(formid, formurls)	
+					data, screenshotsvalidated = Helper.get_screenshot_data(screenshots, screenshotsaftersubmission)
+					map_form_results['screenshotdataaftersubmission'] = data
+					if screenshotsvalidated
+						map_form_results["screenshotsvalidated"] = true
+						map_form_results['formvalidated'] = true
+					else
+						map_form_results["formvalidationerror"] = "Error in screenshot validation."
+					end
+				end
+			end
+			map_result[Helper.generateUID(map_form_results['formid'], map_form_results['formtype'])] = map_form_results	
+		end	
+		map_result	
+	end
+
+	def get_html(formid, formurl)
+		uri = URI.parse("http://localhost:3003/search")
+		header = {'Content-Type': 'text/json'}
+		body = { url: formurl }
+		http = Net::HTTP.new(uri.host, uri.port)
+		request = Net::HTTP::Post.new(uri.request_uri, header)
+		request.body = body.to_json
+		response = http.request(request)
+		html_content = response.body
+		get_form_html(html_content, formid)
+	end
+
+	def get_form_html(html_content, formid)
+		doc = Nokogiri::HTML(html_content)
+		form = doc.css("div[id^=\"#{formid}\"]")
+		form
+	end
+
+	def send_post_request(formid, url, result, formfields, email_disabled, email_host)
+		array = result['settings']
+		uri = URI.parse(url)
+		post_body = []
+		fields = {}
+		formfields.each do |data|	
+			fields[data["id"].to_i] = { "value" => data["value"], "id" => data["id"].to_i }
+		end	
+		settings = get_settings(array)	
+		formData = []
+		formData = {
+			"id" => formid,
+			"fields" => fields,
+			"settings" => settings,
+			"extra" => result['extra']
+		}	
+		action = 'nf_ajax_submit'
+		security = result['nonce']	
+		post_body = {
+			"action" => action,
+			"security" => security,
+			"formData" => formData.to_json
+		}	
+		http = Net::HTTP.new(uri.host, uri.port)
+		request = Net::HTTP::Post.new(uri.request_uri)
+		request.set_form_data(post_body)
+		request["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+		response = http.request(request)	
+		response
+	end
+
+	def get_settings(settings_array)
+		settings = []
+		settings = {
+		'objectType' => settings_array['objectType'],
+		'editActive' => settings_array['editActive'],
+		'title' => settings_array['title'],
+		'show_title' => settings_array['show_title'],
+		'allow_public_link' => settings_array['allow_public_link'],
+		'embed_form' => settings_array['embed_form'],
+		'clear_complete' => settings_array['clear_complete'],
+		'hide_complete' => settings_array['hide_complete'],
+		'default_label_pos' => settings_array['default_label_pos'],
+		'wrapper_class' => settings_array['wrapper_class'],
+		'element_class' => settings_array['element_class'],
+		'form_title_heading_level' => settings_array['form_title_heading_level'],
+		'key' => settings_array['key'],
+		'add_submit' => settings_array['add_submit'],
+		'currency' => settings_array['currency'],
+		'unique_field_error' => settings_array['unique_field_error'],
+		'logged_in' => settings_array['logged_in'],
+		'not_logged_in_msg' => settings_array['not_logged_in_msg'],
+		'sub_limit_msg' => settings_array['sub_limit_msg'],
+		'calculations' => settings_array['calculations'],
+		'ninjaForms' => settings_array['ninjaForms'],
+		'changeEmailErrorMsg' => settings_array['changeEmailErrorMsg'],
+		'changeDateErrorMsg' => settings_array['changeDateErrorMsg'],
+		'confirmFieldErrorMsg' => settings_array['confirmFieldErrorMsg'],
+		'fieldNumberNumMinError' => settings_array['fieldNumberNumMinError'],
+		'fieldNumberNumMaxError' => settings_array['fieldNumberNumMaxError'],
+		'fieldNumberIncrementBy' => settings_array['fieldNumberIncrementBy'],
+		'fieldTextareaRTEInsertLink' => settings_array['fieldTextareaRTEInsertLink'],
+		'fieldTextareaRTEInsertMedia' => settings_array['fieldTextareaRTEInsertMedia'],
+		'fieldTextareaRTESelectAFile' => settings_array['fieldTextareaRTESelectAFile'],
+		'formErrorsCorrectErrors' => settings_array['formErrorsCorrectErrors'],
+		'formHoneypot' => settings_array['formHoneypot'],
+		'validateRequiredField' => settings_array['validateRequiredField'],
+		'honeypotHoneypotError' => settings_array['honeypotHoneypotError'],
+		'fileUploadOldCodeFileUploadInProgress' => settings_array['fileUploadOldCodeFileUploadInProgress'],
+		'fileUploadOldCodeFileUpload' => settings_array['fileUploadOldCodeFileUpload'],
+		'currencySymbol' => settings_array['currencySymbol'],
+		'fieldsMarkedRequired' => settings_array['fieldsMarkedRequired'],
+		'thousands_sep' => settings_array['thousands_sep'],
+		'decimal_point' => settings_array['decimal_point'],
+		'siteLocale' => settings_array['siteLocale'],
+		'dateFormat' => settings_array['dateFormat'],
+		'startOfWeek' => settings_array['startOfWeek'],
+		'of' => settings_array['of'],
+		'previousMonth' => settings_array['previousMonth'],
+		'nextMonth' => settings_array['nextMonth'],
+		'months' => settings_array['months'],
+		'monthsShort' => settings_array['monthsShort'],
+		'weekdays' => settings_array['weekdays'],
+		'weekdaysShort' => settings_array['weekdaysShort'],
+		'weekdaysMin' => settings_array['weekdaysMin'],
+		'recaptchaConsentMissing' => settings_array['recaptchaConsentMissing'],
+		'recaptchaMissingCookie' => settings_array['recaptchaMissingCookie'],
+		'recaptchaConsentEvent' => settings_array['recaptchaConsentEvent'],
+		'currency_symbol' => settings_array['currency_symbol'],
+		'beforeForm' => settings_array['beforeForm'],
+		'beforeFields' => settings_array['beforeFields'],
+		'afterFields' => settings_array['afterFields'],
+		'afterForm' => settings_array['afterForm']
+		}
+		settings
+	end
+end
+
+class WPForms
+	def solvewpforms(results, site_url)
+		map_result = {}
+		results.each do |result|
+			result = result[1]
+			map_form_results = {}
+			formid = result['formid']
+			formurls = result['formurls']
+			formname = result['formname']
+			formfields = result['formfields']
+			email = result['email']
+			email_disabled = result['emaildisabled']
+			additional_settings = result['additionalsettings']
+			map_form_results['formid'] = formid
+			map_form_results['formurls'] = formurls
+			screenshots = Helper.getscreenshots(formid, formurls)
+			map_form_results['screenshots'] = screenshots
+			map_form_results['formname'] = formname
+			map_form_results['formtype'] = "WPForms"
+			map_form_results['formfieldsfromdb'] = formfields
+			map_form_results['email'] = email
+			map_form_results['emaildisabled'] = email_disabled
+			map_form_results['emailhost'] = ""
+			map_form_results['additionalsettings'] = additional_settings
+			form_html = get_form_html(formurls[0], formid)
+			if form_html
+				html = URI.open(formurls[0]).read
+				doc = Nokogiri::HTML(html)
+				form_id = "wpforms-#{formid}"
+				form = doc.css("div[id^='#{form_id}-field_']")
+				labels = form.css('label.wpforms-field-label')
+				inputs = labels.map { |label| label.text.strip }
+				map_form_results['formfieldsfromhtml'] = inputs
+				fields_validated, missing_fields = Helper.validate_form(inputs, result['formlabels'])
+				map_form_results['fieldsvalidated'] = fields_validated
+				debugger
+				if fields_validated
+					sample_values, present_field_values, file_field_present = generate_payload(formfields, form_html, formurls[0], site_url, result)
+					form_field_count = Helper.get_form_field_count(present_field_values)
+					map_form_results['formfieldcount'] = form_field_count
+					map_form_results['samplevalues'] = present_field_values
+					post_response = form_submission(sample_values, site_url, formid, file_field_present)
+					map_form_results['formsubmitted'] = false
+					map_form_results['formvalidationerror'] = 'None'
+					if !post_response.nil?
+						post_response_body = JSON.parse(post_response.body)
+						if (post_response_body["success"])
+							map_form_results['formsubmitted'] = true
+							map_form_results['formvalidationerror'] = 'None'
+						else
+							map_form_results["formvalidationerror"] = "Error in form submission."
+						end
+					end
+				else
+					map_form_results['formvalidationerror'] = "Field validation unsuccessful. Missing fields are : #{missing_fields}"
+				end
+				map_form_results["screenshotsvalidated"] = false
+				if !map_form_results['formsubmitted'] || !map_form_results['fieldsvalidated']
+					map_form_results['formvalidated'] = false
+				else	
+					screenshotsaftersubmission = Helper.getscreenshots(formid, formurls)
+					data, screenshotsvalidated = Helper.get_screenshot_data(screenshots, screenshotsaftersubmission)
+					map_form_results['screenshotdataaftersubmission'] = data
+					if screenshotsvalidated
+						map_form_results["screenshotsvalidated"] = true
+						map_form_results['formvalidated'] = true
+					else
+						map_form_results["formvalidationerror"] = "Error in screenshot validation."
+					end
+				end
+			end
+			map_result[Helper.generateUID(map_form_results['formid'], map_form_results['formtype'])] = map_form_results
+		end
+		map_result
+	end
+
+	def check_labels(html_labels, db_labels)
+		missing_fields = html_labels - (html_labels & db_labels)
+		return missing_fields.empty?, missing_fields
+	end
+
+	def validate_form(html_fields, db_fields)
+		html_names = []
+		html_fields.each do |field|	
+			html_names.append(field.gsub(" *", ""))
+		end	
+		missing_fields = html_names - (html_names & db_fields)
+		return missing_fields.empty?, missing_fields
+	end
+
+	def get_image_data(form_id, field_id, form_url)
+		html_code = URI.open(form_url).read
+		doc = Nokogiri::HTML(html_code)
+		uploader_divs = doc.css('div.wpforms-uploader')
+		extensions = ""
+		chunk_size = ""
+		uploader_divs.each do |uploader_div|
+			if (uploader_div['data-form-id'] == form_id && uploader_div['data-field-id'] == field_id)
+				extensions = uploader_div['data-extensions']
+				chunk_size = uploader_div['data-file-chunk-size']
+			end
+		end
+		extensions_array = extensions.split(',')
+		extension = extensions_array[0]
+		filename = "dummy.#{extension}"
+		filepath = "./#{filename}"
+		base64_image = File.open(filepath, "rb") do |file|
+			Base64.strict_encode64(file.read)
+		end
+		binary_data = Base64.decode64(base64_image)
+		uuid = SecureRandom.uuid.gsub('-', '')
+		formatted_uuid = "#{uuid[0..7]}-#{uuid[8..11]}-#{uuid[12..15]}-#{uuid[16..19]}-#{uuid[20..31]}"
+		data = {
+			"action" => "wpforms_upload_chunk_init",
+			"form_id" => form_id,
+			"field_id" => field_id,
+			"name" => filename,
+			"slow" => "false",
+			"dzuuid" => formatted_uuid,
+			"dzchunkindex" => "0",
+			"dztotalfilesize" => "108",
+			"dzchunksize" => chunk_size,
+			"dzchunkbyteoffset" => "0"
+		}
+		new_url = form_url + "/wp-admin/admin-ajax.php"
+		uri = URI.parse(new_url)
+		request = Net::HTTP::Post.new(uri)
+		request.set_form data,'multipart/form-data'
+		response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+			http.request(request)
+		end
+		response_body = JSON.parse(response.body)
+		response_data = response_body["data"]
+		dzchunksize = response_data["dzchunksize"]
+		content_type = 'application/octet-stream'
+		file_part = "Content-Disposition: form-data; name=\"#{field_label}\"; filename=\"#{File.basename(filepath)}\"\r\n" +
+		"Content-Type: application/octet-stream\r\n\r\n#{binary_data}\r\n"
+		fields = {
+			'dzuuid' => formatted_uuid,
+			'dzchunkindex' => '0',
+			'dztotalfilesize' => '108',
+			'dzchunksize' => dzchunksize,
+			'dztotalchunkcount' => '1',
+			'dzchunkbyteoffset' => '0',
+			'action' => 'wpforms_upload_chunk',
+			'form_id' => form_id,
+			'field_id' => field_id,
+		}
+		boundary = "----RubyFormBoundary#{rand(100000)}"
+		body = fields.map { |name, value| "--#{boundary}\r\nContent-Disposition: form-data; name=\"#{name}\"\r\n\r\n#{value}\r\n" }.join("") + "--#{boundary}\r\n#{file_part}" + "--#{boundary}--\r\n"
+		request = Net::HTTP::Post.new(uri.path)
+		request.content_type = "multipart/form-data; boundary=#{boundary}"
+		request.body = body
+		response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+			http.request(request)
+		end
+		final_payload = {
+			"action": "wpforms_file_chunks_uploaded",
+			"form_id": form_id,
+			"field_id": field_id,
+			"name": filename,
+			"dzuuid": formatted_uuid,
+			"dzchunkindex": 0,
+			"dztotalfilesize": 108,
+			"dzchunksize": dzchunksize,
+			"dztotalchunkcount": 1,
+			"dzchunkbyteoffset": 0
+		}
+		request = Net::HTTP::Post.new(uri)
+		request.set_form(final_payload)
+		response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+			http.request(request)
+		end
+		response_data = JSON.parse(response.body)
+		value = response_data["data"]
+		add_array = [value]
+		add_json = add_array.to_json
+		field_value = "#{add_json}"
+		field_value
+	end
+
+
+	def generate_payload(form_fields, html_fields, html_url, form_url, result)
+		response = URI.open(html_url).read
+		parsed_html = Nokogiri::HTML(response)
+		forms = parsed_html.css('form[data-token]')
+		token = forms.any? { |form| form['data-formid'] == result["formid"] } ? forms.find { |form| form['data-formid'] == result["formid"] }['data-token'] : nil
+		present_fields_values = []
+		file_field_present, sample_values = Helper.generate_sample_values(html_fields, form_url, result["formid"])
+		form_field = form_fields
+		present_fields_values = form_field.map do |field|
+			sample_value = sample_values.find { |value| value["name"].include?("fields][#{field['id']}") }
+			{
+				"id": field['id'],
+				"name": field['name'],
+				"type": field['type'],
+				"validations": '',
+				"value": sample_value ? sample_value['value'] : nil
+			}
+		end
+		sample_values << {"name" => "wpforms[id]", "value" => result["formid"]}
+		sample_values << {"name" => "wpforms[nonce]", "value" => result["nonce"]}
+		sample_values << {"name" => "wpforms[author]", "value" => result["author"]}
+		sample_values << {"name" => "wpforms[post_id]", "value" => result["postid"]}
+		sample_values << {"name" => "wpforms[submit]", "value" => "wpforms-submit"}
+		sample_values << {"name" => "wpforms[token]", "value" => token}
+		sample_values << {"name" => "action", "value" => "wpforms_submit"}
+		sample_values << {"name" =>"page_url", "value" => html_url}
+		sample_values << {"name" =>"page_title", "value" => result["formname"]}
+		sample_values << {"name" =>"page_id" , "value" => "#{result["pageid"]}"}
+		return sample_values, present_fields_values, file_field_present
+	end
+
+	def get_image_field_id(name)
+		name.match(/\d+$/).to_s.to_i
+	end
+
+	def get_form_html(html_url, form_id)
+		request = URI.open(html_url).read
+		doc = Nokogiri::HTML(request)
+		form_fields = []
+		unique_radio = ""
+		unique_checkbox = ""
+		html_fields = doc.css("#wpforms-#{form_id} input,#wpforms-#{form_id} textarea,#wpforms-#{form_id} select")
+		html_fields.each do |field|
+			if field["type"] != "hidden"
+				id = field["id"]
+				type = field["type"] || field.name
+				label = field["placeholder"] || field["name"]
+				case type
+				when "radio"
+					if label != unique_radio
+						unique_radio = label
+						value = field["value"]
+						form_fields << {"id" => id, "name" => label, "type" => type, "value" => value, "validations" => "", "class" => ""}
+					end
+				when "text"
+					label[8] == '_' ? form_fields << {"name" => label, "type" => type, "id" => get_image_field_id(label), "validations" => "", "class" => ""} : 
+					form_fields << {"id" => id, "name" => label, "type" => type, "value" => "", "validations" => "", "class" => ""}
+				when "range"
+					value = field["min"]
+					form_fields << {"id" => id, "name" => label, "type" => type, "value" => value, "validations" => "", "class" => ""}
+				when "checkbox"
+					if unique_checkbox != label
+						unique_checkbox = label
+						value = field["value"]
+						form_fields << {"id" => id, "name" => label, "type" => type, "value" => value, "validations" => "", "class" => ""}
+					end
+				when "select"
+					first_option = field.css("option").first
+					form_fields << {"id" => id, "name" => label, "type" => type, "value" => first_option["value"], "validations" => "", "class" => ""} unless first_option.nil?
+				else
+					form_fields << {"id" => id, "name" => label, "type" => type, "value" => "", "validations" => "", "class" => ""}
+				end
+			end
+		end
+		form_fields
+	end
+
+	def form_submission(sample_values, site_url, form_id, file_field_present)
+		extended_url = file_field_present ? "?wpforms_form_id=#{form_id}" : "/wp-admin/admin-ajax.php"
+		new_url = site_url+ extended_url
+		data = sample_values.map { |obj| [obj["name"], obj["value"]] }.to_h
+		response = Helper.post_request(new_url, data)
+		response
+	end
+end
+
+class FluentForms
+	def solvefluentforms(results, site_url)
+		map_result = {}
+		results.each do |result|
+			result = result[1]
+			map_form_results = {}
+			formid = result['formid']
+			formurls = result['formurls']
+			formname = result['formname']
+			formfields = result['formfields']
+			email = result['email']
+			email_disabled = result['emaildisabled']
+			additional_settings = result['additionalsettings']
+			map_form_results['formid'] = formid
+			map_form_results['formurls'] = formurls
+			screenshots = Helper.getscreenshots(formid, formurls)
+			map_form_results['screenshots'] = screenshots
+			map_form_results['formname'] = formname
+			map_form_results['formtype'] = "Fluent Form"
+			map_form_results['formfieldsfromdb'] = formfields
+			map_form_results['email'] = email
+			map_form_results['emaildisabled'] = email_disabled
+			map_form_results['emailhost'] = ""
+			map_form_results['additionalsettings'] = additional_settings
+			hidden_fields = get_hidden_fields(formid, formurls[0])
+			if hidden_fields && !hidden_fields.empty?
+				html = URI.open(formurls[0]).read
+				doc = Nokogiri::HTML(html)
+				formname = "fluentform_wrapper_#{formid}"
+				form = doc.css("div[class*=\"#{formname}\"]")
+				labels = form.css("div.ff-el-input--label label")
+				inputs = labels.map { |label| label.text }
+				map_form_results['formfieldsfromhtml'] = inputs
+				fields_validated, missing_fields = Helper.validate_form(inputs, result['formlabels'])		
+				map_form_results['fieldsvalidated'] = fields_validated
+				if fields_validated
+					file_field_present, sample_values = Helper.generate_sample_values(formfields, formurls[0], formid)	
+					form_field_count = Helper.get_form_field_count(sample_values)
+					map_form_results['formfieldcount'] = form_field_count
+					map_form_results['samplevalues'] = sample_values
+					post_response = form_submission(hidden_fields, sample_values, formid, site_url)
+					map_form_results['formsubmitted'] = false
+					map_form_results['formvalidationerror'] = 'None'
+					if !post_response.nil?
+						post_response_body = JSON.parse(post_response.body)
+						if (post_response_body["success"])
+							map_form_results['formsubmitted'] = true
+							map_form_results['formvalidationerror'] = 'None'
+						else
+							map_form_results["formvalidationerror"] = "Error in form submission."
+						end
+					end
+				else
+					map_form_results['formvalidationerror'] = "Field validation unsuccessful. Missing fields are #{missing_fields}"
+				end
+				map_form_results["screenshotsvalidated"] = false
+				if !map_form_results['formsubmitted'] || !map_form_results['fieldsvalidated']
+					map_form_results['formvalidated'] = false
+				else	
+					screenshotsaftersubmission = Helper.getscreenshots(formid, formurls)
+					data, screenshotsvalidated = Helper.get_screenshot_data(screenshots, screenshotsaftersubmission)
+					map_form_results['screenshotdataaftersubmission'] = data
+					if screenshotsvalidated
+						map_form_results["screenshotsvalidated"] = true
+						map_form_results['formvalidated'] = true
+					else
+						map_form_results["formvalidationerror"] = "Error in screenshot validation."
+					end
+				end
+			end
+			map_result[Helper.generateUID(map_form_results['formid'], map_form_results['formtype'])] = map_form_results
+		end
+		map_result
+	end
+	def check_labels(html_labels, db_labels)
+		missing_fields = html_labels - (html_labels & db_labels)
+		return missing_fields.empty?, missing_fields
+	end
+
+	def form_submission(hidden_fields, sample_values, form_id, site_url)
+		hidden_data = hidden_fields.map { |field| "#{field['name']}=#{CGI.escape(field['value'].to_s)}" }.join('&')
+		sample_data = sample_values.map { |field| "#{field['label']}=#{CGI.escape(field['value'].to_s)}" }.join('&')
+		data = hidden_data + "&" + sample_data
+		payload = {
+			'data': data,
+			'action': 'fluentform_submit',
+			'form_id': form_id
+		}
+		current_time = Time.now
+		timestamp = (current_time.to_i * 1000) + (current_time.usec / 1000)
+		new_url = site_url + "/wp-admin/admin-ajax.php?t=#{timestamp}"
+		response = Helper.post_request(new_url, payload)
+		response
+	end
+
+	def get_hidden_fields(form_id, form_url)
+		html = URI.open(form_url).read
+		doc = Nokogiri::HTML(html)
+		hidden_fields = []
+		form = doc.at_css("#fluentform_#{form_id}")
+		inputs = form.css('input, textarea, select')
+		inputs.each do |input|
+			name = input['data-name'] || input['name']
+			type = input['type']
+			if 'hidden' == type
+				hidden_fields << {"name" => name, "type" => type, "value" => input['value']}
+			end
+		end
+		hidden_fields
+	end
+end
+
+class FormidableFormTests
+	def solve(forms_data, site_url)
+
+		results = {}
+		forms_data.each do |form|
+			form = form[1]
+			puts form
+			result = {}
+			result["formid"] = form["formid"]
+			result["formurls"] = form["formurls"] # Sending one post per form for now.
+			screenshots = Helper.getscreenshots(form["formid"], form["formurls"])
+			result["screenshots"] = screenshots
+			result["formname"] = form["formname"]
+			result["formtype"] = "Formidable Forms"
+			result["formfieldsfromdb"] = form["formfields"]
+			result["email"] = nil
+			result["emaildisabled"] = nil
+			result["emailhost"] = nil
+			result["additionalsettings"] = nil
+
+
+			url = URI(form["formurls"][0])
+			doc = Nokogiri::HTML.parse(Net::HTTP.get(url))
+
+			fields_missing = []
+			error = false
+			form["formfields"].each do |field|
+				field_label = doc.css("#field_"+field["field_key"]+"_label").first
+
+				if field_label.nil?
+					fields_missing.append(field['formname'])
+					error = true
+				end
+			end
+
+			result["fieldsvalidated"] = !error
+			result["formfieldcount"] = form["formfields"].length
+
+
+			http = Net::HTTP.new(url.host, url.port)
+			request = Net::HTTP::Post.new(url)
+
+			form_submit_data, sample_data = generate_sample_data(form["formid"], doc)
+			result["samplevalues"] = sample_data
+			form_submit_data['form_id'] = "#{form["formid"]}"
+			antispam_token = doc.at('form')['data-token']
+			if antispam_token
+				form_submit_data['antispam_token'] = antispam_token
+			end
+
+			request["Content-Type"] = 'application/x-www-form-urlencoded'
+
+			# POST sample data to Form URL.
+			request.set_form_data(form_submit_data)
+			response = http.request(request)
+
+			# puts 'response from form post - '
+			# response.instance_variables.each do |var|
+			#   var_value = response.instance_variable_get(var)
+			#   puts "#{var} => #{var_value.inspect}"
+			# end
+			#
+			response_html = Nokogiri::HTML.parse(response.body)
+
+			result["formvalidationerror"] = "Field validation unsuccessful."
+
+			success_msg = response_html.css('.frm_message').css('p').text.strip
+			if success_msg == "Your responses were successfully submitted. Thank you!"
+				result["formsubmitted"] = true
+			else
+				result["formvalidationerror"] = "Error in form submission."
+			end
+			result["screenshotsvalidated"] = false
+
+			if !result["formsubmitted"] || !result["fieldsvalidated"]
+				result["formvalidated"] = false
+			else	
+				screenshotsaftersubmission = Helper.getscreenshots(form["formid"], form["formurls"])
+
+				data, screenshotsvalidated = Helper.get_screenshot_data(screenshots, screenshotsaftersubmission)
+				result["screenshotdataaftersubmission"] = data
+				if screenshotsvalidated
+					result["formvalidated"] = true
+					result["screenshotsvalidated"] = true
+				else
+					result["formvalidationerror"] = "Error in screenshot validation."
+				end
+			end
+
+			results[Helper.generateUID(form['formid'], result['formtype'])] = result
+		end
+		results
+	end
+
+	def generate_sample_data(form_id, parsed_html)
+		form_to_test = nil
+		parsed_html.css('form').each do |form|
+			if form.css('input[name="form_id"]').attr('value').to_s == form_id
+				form_to_test = form
+				break
+			end
+		end
+		sample_data = []
+		form_submit_data = {}
+
+		# Extract fields for current form
+		fields = form_to_test.css('input') + form_to_test.css('textarea')
+
+		antispam_token = form_to_test['data-token']
+		if antispam_token
+			form_submit_data["antispam_token"] = antispam_token
+		end
+
+
+		# Generate data for each field
+		fields.each do |field|
+			name = field.attr('name')
+			type = field.attr('type')
+
+			if type.nil?
+				if field.name == 'textarea'
+					type = 'textarea'
+				end
+			end
+
+			value = ''
+			case type
+			when 'text'
+				value = Faker::Lorem.sentence
+			when 'textarea'
+				value = Faker::Lorem.sentence
+			when 'email'
+				value = Faker::Internet.email
+			when 'tel'
+				value = Faker::Base.numerify('(###) ### ####')
+			when 'date'
+				value = Faker::Date.between(from: Date.today - 365, to: Date.today)
+			when 'number'
+				value = 2485729
+			when 'checkbox'
+				value = [true, false].sample
+			when 'radio'
+				options = form_to_test.css("input[name=#{name}]")
+				value = options[rand(options.length)].attr('value')
+			when 'file'
+				field_id = name.scan(/\d+/).first
+				script_tag = doc.at('script:contains("var frm_js")')
+
+				# Extract the value of the "nonce" key from the "radob" object
+				nonce_value = script_tag.text.match(/"nonce":\s*"(.*?)"/)&.captures&.first
+
+				script_tag = doc.at('script:contains("__frmDropzone")')
+				accepted_files = []
+				if script_tag
+					match_data = script_tag.text.match(/__frmDropzone=(\[.*?\]);/)
+					if match_data
+						json_str = match_data[1].gsub(/(?<=\w)\\?\//, '/')
+						json_obj = JSON.parse(json_str).first
+						accepted_files = json_obj['acceptedFiles'].split(",").map do |item|
+							item.strip
+						end
+					end
+				end
+
+
+				mime_type = accepted_files[0]
+				filename = "sample.#{mime_type.split('/')[1]}"
+
+
+				filepath = "./#{filename}"
+				file_upload_url = URI.join(url, '/wp-admin/admin-ajax.php')
+
+				request = Net::HTTP::Post.new(file_upload_url.request_uri)
+				http = Net::HTTP.new(file_upload_url.host, file_upload_url.port)
+				http.use_ssl = (file_upload_url.scheme == "https")
+				# Set the multipart form data headers
+				boundary = "---------------------------#{rand(10**10)}#{rand(10**10)}#{rand(10**10)}"
+				request['Content-Type'] = "multipart/form-data; boundary=#{boundary}"
+
+				# Create the body of the request
+				body = []
+				body << "--#{boundary}\r\n"
+				body << "Content-Disposition: form-data; name=\"action\"\r\n\r\n"
+				body << "frm_submit_dropzone\r\n"
+				body << "--#{boundary}\r\n"
+				body << "Content-Disposition: form-data; name=\"field_id\"\r\n\r\n"
+				body << "#{field_id}\r\n"
+				body << "--#{boundary}\r\n"
+				body << "Content-Disposition: form-data; name=\"form_id\"\r\n\r\n"
+				body << "#{form_id}\r\n"
+				body << "--#{boundary}\r\n"
+				body << "Content-Disposition: form-data; name=\"nonce\"\r\n\r\n"
+				body << "#{nonce_value}\r\n"
+				body << "--#{boundary}\r\n"
+				body << "Content-Disposition: form-data; name=\"file#{field_id}\"; filename=\"#{filename}\"\r\n"
+				body << "Content-Type: #{mime_type}\r\n\r\n"
+				body << File.read(filepath)
+				body << "\r\n--#{boundary}--\r\n"
+
+				# Set the body of the request
+				request.body = body.join
+				response = http.request(request)
+				#puts "---------"
+				#puts response.body
+				#puts "---------"
+				filecode = JSON.parse(response.body)[0]
+				form_submit_data["item_meta[#{field_id}]"] = filecode
+			when 'textarea'
+				value = Faker::Lorem.paragraph
+			when 'range'
+				value = field.attr('max')
+			when 'hidden'
+				# This check
+				if !form_submit_data.key?(name)
+					value = field.attr('value')
+				end
+			end
+
+			if name.starts_with?("item_meta") and type!="hidden"
+				label_element = nil
+				if type=="textarea"
+					label_element = form_to_test.at_css("textarea[name=\"#{name}\"]").previous_element
+				else
+					label_element = form_to_test.at_css("input[name=\"#{name}\"]").previous_element
+				end
+
+				if !label_element.nil?
+					field_name = label_element.text.strip.split("\n")[0] # Example label text: "Text\n        *\n    "\
+					sample_data.append({"name" => field_name, "value" => value})
+				end
+			end
+
+			form_submit_data[name] = value
+
+		end
+		# "frm_verify" has to be empty for form submission. As it has type
+		# "text", it gets assigned a random value.
+		form_submit_data["frm_verify"] = form_to_test.css('input[name="frm_verify"]').attr('value').to_s
+		# if sample_data.has_key?("frm_verify")
+		# 	sample_data.delete("frm_verify")
+		# end
+
+		return form_submit_data, sample_data
+	end
+end
+
+class ForminatorFormTests
+	@has_file = false
+	def solve(forms_data, site_url)
+
+		results = {}
+		forms_data.each do |form|
+			form = form[1]
+			puts form
+			result = {}
+			result["formid"] = form["formid"]
+			result["formurls"] = form["formurls"]
+			screenshots = Helper.getscreenshots(form["formid"], form["formurls"])
+			result["screenshots"] = screenshots
+			result["formname"] = form["formname"]
+			result["formtype"] = "Forminator Forms"
+			result["email"] = nil
+			result["emaildisabled"] = nil
+			result["emailhost"] = nil
+			result["additionalsettings"] = nil
+
+
+			url = URI(form["formurls"][0])
+			puts url
+			doc = Nokogiri::HTML.parse(Net::HTTP.get(url))
+			form_html = doc.css("form[data-form-id=#{form["formid"]}]").first
+
+			fields = form["formfields"]
+			fields_missing = []
+
+			label_elements = form_html.css('*[class="forminator-label"]')
+			fields_html = label_elements.map { |element| element.xpath('text()').text.strip }
+
+			if fields_html.sort != fields.sort
+				error = true
+			end
+
+			result["fieldsvalidated"] = !error
+			result["formfieldcount"] = form["formfields"].length
+
+
+			http = Net::HTTP.new(url.host, url.port)
+			request = Net::HTTP::Post.new(url)
+
+			form_submit_data, sample_data = generate_sample_data(form["formid"], form_html)
+			result["formfieldsfromdb"] = sample_data
+			result["formfields"] = sample_data
+			result["samplevalues"] = sample_data
+
+			if form["enable-ajax"] == "true"
+				url = URI(site_url + "/wp-admin/admin-ajax.php")
+			end
+
+			request["Content-Type"] = 'application/x-www-form-urlencoded'
+			if form["enable-ajax"] == "true" or @has_file
+				request["Content-Type"] = 'multipart/form-data'
+			end
+			form_submit_data['form_id'] = "#{form["formid"]}"
+
+
+			# POST sample data to Form URL.
+			request.set_form_data(form_submit_data)
+			response = http.request(request)
+
+			result["formvalidated"] = true
+			result["formvalidationerror"] = "Field validation unsuccessful."
+
+			# form_submit_data, sample_data = generate_sample_data(form["formid"], doc)
+			# result["samplevalues"] = sample_data
+
+			response_html = Nokogiri::HTML.parse(response.body)
+
+			success_msg = response_html.css('.forminator-label--forminator-success').text.strip
+			if success_msg
+				result["formsubmitted"] = true
+			else
+				result["formvalidationerror"] = "Error in form submission."
+			end
+
+			result["screenshotsvalidated"] = false
+			if !result["formsubmitted"] || !result["fieldsvalidated"]
+				result["formvalidated"] = false
+			else	
+				screenshotsaftersubmission = Helper.getscreenshots(form["formid"], form["formurls"])
+				data, screenshotsvalidated = Helper.get_screenshot_data(screenshots, screenshotsaftersubmission)
+
+				result["screenshotdataaftersubmission"] = data
+				if screenshotsvalidated
+					result["formvalidated"] = true
+					result["screenshotsvalidated"] = true
+				else
+					result["formvalidationerror"] = "Error in screenshot validation."
+				end
+			end
+
+			results[Helper.generateUID(form['formid'], result['formtype'])] = result
+		end
+		results
+	end
+
+	def generate_sample_data(form_id, form_to_test)
+		sample_data = []
+		form_submit_data = {}
+		filename = ''
+		# Extract fields for current form
+		fields = form_to_test.css('input') + form_to_test.css('textarea') + form_to_test.css('select')
+
+		# Generate data for each field
+		fields.each do |field|
+			name = field.attr('name')
+			type = field.attr('type')
+
+
+			if type.nil?
+				if field.name == 'textarea'
+					type = 'textarea'
+				elsif field.name == 'select'
+					type = 'select'
+				end
+			end
+
+			value = ''
+			case type
+			when 'text'
+				if name.starts_with?("date")
+					date_format = field.attr('data-format')
+					now = Time.now
+					if date_format == "mm/dd/yy"
+						value = now.strftime("%-m/%-d/%Y")
+					end
+				elsif name.starts_with?("phone")
+					value = Faker::Base.numerify('##########')
+				else
+					value = Faker::Lorem.sentence
+				end
+			when 'textarea'
+				value = Faker::Lorem.sentence
+			when 'email'
+				value = Faker::Internet.email
+			when 'tel'
+				value = Faker::Base.numerify('(###) ### ####')
+			when 'date'
+				value = Faker::Date.between(from: Date.today - 365, to: Date.today)
+			when 'number'
+				if name.starts_with?("date")
+					day_month_year = field.attr('data-field')
+
+					case day_month_year
+					when 'day'
+						value = Time.now.day.to_s
+					when 'month'
+						value = Time.now.month.to_s
+					when 'year'
+						value = Time.now.year.to_s
+					end
+
+				elsif field.attr('min')
+					value = field.attr('min')
+				else
+					value = 2485
+				end
+			when 'checkbox'
+				value = field.attr('value')
+			when 'radio'
+				options = form_to_test.css("input[name=#{name}]")
+				value = options[rand(options.length)].attr('value')
+
+			when 'textarea'
+				value = Faker::Lorem.paragraph
+			when 'range'
+				value = field.attr('max')
+			when 'select'
+				value = field.css('option').last['value']
+			when 'file'
+				@has_file = true
+				url = 'https://sample-videos.com/img/Sample-png-image-100kb.png' 
+				filename = 'sample_image.png' 
+				File.open(filename, 'wb') do |file|
+					file.write open(url).read
+				end
+
+				#accepted_exts = field.attr('accept').split(',')
+				#filename = "sample#{accepted_exts[0]}"
+				file = File.open(filename, "rb")
+				value = {
+					filename => file.read
+				}
+				file.close
+			when 'hidden'
+				# This check
+				# if !form_submit_data.key?(name)
+				value = field.attr('value')
+				# end
+			end
+
+			if !form_submit_data.key?(name)
+				form_submit_data[name] = value
+			end
+
+			if type!="hidden"
+				label_element = nil
+				field = field.ancestors('.forminator-field').first
+				label_element =  field.css('*[class="forminator-label"]')
+				if !label_element.nil?
+					field_name = label_element.xpath('text()').text.strip
+					if type=="file"
+						sample_data.append({"name" => field_name, "value" => filename, "type" => ""})
+					else
+						sample_data.append({"name" => field_name, "value" => value, "type" => ""})
+					end
+				end
+			end
+
+			form_submit_data[name] = value
+
+		end
+		# "frm_verify" has to be empty for form submission. As it has type
+		# "text", it gets assigned a random value.
+		form_submit_data["frm_verify"] = form_to_test.css('input[name="frm_verify"]').attr('value').to_s
+
+		return form_submit_data, sample_data
+	end
+end
